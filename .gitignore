@@ -1,0 +1,6 @@
+# OS and temp files
+Thumbs.db
+Desktop.ini
+*.tmp
+*.log
+.DS_Store
