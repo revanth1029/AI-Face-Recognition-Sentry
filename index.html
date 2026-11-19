@@ -59,6 +59,10 @@
                         <span>REAL-TIME MONITOR</span>
                     </div>
                     <div class="dashboard-stats" style="margin-left: auto; gap: 0.5rem; display: flex; align-items: center;">
+                        <div class="status-item alert-badge" id="unregistered-badge" style="font-size: 0.7rem; padding: 0.2rem 0.5rem; display: none; color: var(--accent-red); border-color: rgba(244, 63, 94, 0.4); background: rgba(244, 63, 94, 0.12);">
+                            <i class="fa-solid fa-triangle-exclamation" style="margin-right: 0.25rem;"></i>
+                            <span>UNREGISTERED DETECTED</span>
+                        </div>
                         <div class="status-item" id="faces-badge" style="font-size: 0.7rem; padding: 0.2rem 0.5rem; display: none; color: var(--accent-green);">
                             <i class="fa-solid fa-users" style="margin-right: 0.25rem;"></i>
                             <span id="faces-count-text">0 Faces</span>
@@ -72,6 +76,10 @@
                 <div class="viewfinder-container" id="viewfinder-container" title="Click on any face to select it for enrollment">
                     <video id="webcam" autoplay muted playsinline></video>
                     <canvas id="overlay"></canvas>
+                    <div id="unregistered-alert-banner" class="unregistered-alert-banner" style="display: none;">
+                        <i class="fa-solid fa-triangle-exclamation"></i>
+                        <span id="unregistered-alert-text">ALERT: UNREGISTERED PERSON DETECTED</span>
+                    </div>
                 </div>
                 
                 <div class="camera-controls">

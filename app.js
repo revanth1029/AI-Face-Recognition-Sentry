@@ -40,6 +40,9 @@ const btnRefreshCameras = document.getElementById('btn-refresh-cameras');
 let selectedDeviceId = localStorage.getItem('face_sentry_camera_id') || '';
 const facesBadge = document.getElementById('faces-badge');
 const facesCountText = document.getElementById('faces-count-text');
+const unregisteredAlertBanner = document.getElementById('unregistered-alert-banner');
+const unregisteredAlertText = document.getElementById('unregistered-alert-text');
+const unregisteredBadge = document.getElementById('unregistered-badge');
 
 // Expression modes
 const btnSensHigh = document.getElementById('btn-sens-high');
@@ -578,6 +581,8 @@ function stopCamera() {
         scanIcon.style.display = 'none';
         videoIcon.style.display = 'inline-block';
         if (facesBadge) facesBadge.style.display = 'none';
+        if (unregisteredBadge) unregisteredBadge.style.display = 'none';
+        if (unregisteredAlertBanner) unregisteredAlertBanner.style.display = 'none';
         if (faceSelectorContainer) faceSelectorContainer.style.display = 'none';
         faceTrackCache.clear();
         
@@ -667,13 +672,13 @@ function matchAllFacesOptimal(detections, profiles, threshold) {
         }
     }
 
-    // 4. Any remaining face that was not assigned is SUSPECT UNKNOWN
+    // 4. Any remaining face that was not assigned is UNREGISTERED PERSON
     for (let i = 0; i < detections.length; i++) {
         if (!results[i]) {
             results[i] = {
                 faceIndex: i,
                 isMatch: false,
-                labelName: "SUSPECT UNKNOWN",
+                labelName: "UNREGISTERED PERSON",
                 confidenceScore: detections[i].detection.score || 0.85,
                 distance: 1.0,
                 statusColor: '#f43f5e' // neon rose/red
@@ -1114,6 +1119,23 @@ function drawCustomHUD(canvas, resizedDetections, matchResults) {
             }
         }
     });
+
+    // Check for unregistered persons in viewport
+    const unregisteredCount = matchResults.filter(m => !m.isMatch).length;
+    if (unregisteredCount > 0 && isDetecting) {
+        if (unregisteredAlertBanner) {
+            unregisteredAlertBanner.style.display = 'flex';
+            if (unregisteredAlertText) {
+                unregisteredAlertText.innerText = unregisteredCount === 1
+                    ? "SECURITY ALERT: UNREGISTERED PERSON DETECTED"
+                    : `SECURITY ALERT: ${unregisteredCount} UNREGISTERED PERSONS DETECTED`;
+            }
+        }
+        if (unregisteredBadge) unregisteredBadge.style.display = 'inline-flex';
+    } else {
+        if (unregisteredAlertBanner) unregisteredAlertBanner.style.display = 'none';
+        if (unregisteredBadge) unregisteredBadge.style.display = 'none';
+    }
     
     // Update Multi-Face simultaneous status in the header
     if (facesBadge && facesCountText) {
@@ -1132,10 +1154,8 @@ function handleLoggingThrottled(name, isMatch, timeNow) {
         lastSeen[name] = timeNow;
         if (isMatch) {
             addLog(`Face recognized: ${name}`, 'match');
-        } else if (name === "SUSPECT UNKNOWN") {
-            addLog("Alert: Unregistered face in viewport.", 'unknown');
-        } else if (name === "UNREGISTERED TARGET") {
-            addLog("Detection: Unregistered face detected.", 'unknown');
+        } else {
+            addLog("SECURITY ALERT: Unregistered person in camera view!", 'unknown');
         }
     }
 }
