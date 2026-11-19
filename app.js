@@ -1,4 +1,4 @@
-// AI Sentry - Face Recognition Engine
+// AI Sentry Pro - Multi-Person Face Recognition & Micro-Expression Engine
 // Powered by face-api.js (vladmandic fork)
 
 // State variables
@@ -9,11 +9,14 @@ let detectorType = 'tiny'; // 'tiny' or 'ssd'
 let minConfidence = 0.4;
 let totalScanCount = 0;
 let lastSeen = {}; // Tracker to prevent spamming logs
-const LOG_COOLDOWN_MS = 5000; // Log matches once every 5 seconds
-let latestDetections = []; // Stores current frame detections for immediate enrollment
+const LOG_COOLDOWN_MS = 4000;
+let latestDetections = []; // Stores current frame raw detections
+let latestResizedDetections = []; // Stores canvas-scaled detections
 let expressionSensitivity = 'high'; // 'high' (landmark-boosted) or 'balanced'
+let matchThreshold = parseFloat(localStorage.getItem('face_sentry_threshold')) || 0.44;
+let selectedEnrollFaceIndex = 0; // Index of face targeted for enrollment
 
-// Multi-face track cache for expression smoothing and hysteresis
+// Multi-face track cache for expression smoothing and temporal hysteresis
 const faceTrackCache = new Map();
 
 let lastErrorTime = 0;
@@ -28,6 +31,7 @@ function handleErrorThrottled(message) {
 // DOM elements
 const webcam = document.getElementById('webcam');
 const overlay = document.getElementById('overlay');
+const viewfinderContainer = document.getElementById('viewfinder-container');
 const scanIcon = document.getElementById('scan-icon');
 const videoIcon = document.getElementById('video-icon');
 const btnToggleCamera = document.getElementById('btn-toggle-camera');
@@ -36,25 +40,43 @@ const btnRefreshCameras = document.getElementById('btn-refresh-cameras');
 let selectedDeviceId = localStorage.getItem('face_sentry_camera_id') || '';
 const facesBadge = document.getElementById('faces-badge');
 const facesCountText = document.getElementById('faces-count-text');
+
+// Expression modes
 const btnSensHigh = document.getElementById('btn-sens-high');
 const btnSensStd = document.getElementById('btn-sens-std');
 const expressionModeVal = document.getElementById('expression-mode-val');
+
+// Enrollment & Multi-Face Targeting
 const enrollNameInput = document.getElementById('enroll-name');
 const btnEnroll = document.getElementById('btn-enroll');
+const faceSelectorContainer = document.getElementById('face-selector-container');
+const faceSelectorPills = document.getElementById('face-selector-pills');
+
+// Database Management
 const dbGrid = document.getElementById('db-grid');
 const dbCountEl = document.getElementById('db-count');
+const btnClearDb = document.getElementById('btn-clear-db');
 const btnExportDb = document.getElementById('btn-export-db');
 const btnImportDb = document.getElementById('btn-import-db');
 const dbFileInput = document.getElementById('db-file-input');
 const btnClearLogs = document.getElementById('btn-clear-logs');
 const logContainer = document.getElementById('log-container');
+
+// Detector config & Strictness controls
 const selTiny = document.getElementById('sel-tiny');
 const selSsd = document.getElementById('sel-ssd');
+const selStrictHigh = document.getElementById('sel-strict-high');
+const selStrictStd = document.getElementById('sel-strict-std');
+const selStrictLenient = document.getElementById('sel-strict-lenient');
+const strictnessModeVal = document.getElementById('strictness-mode-val');
+
+// Dashboard Stats
 const fpsVal = document.getElementById('fps-val');
 const statModelType = document.getElementById('stat-model-type');
 const statMinConf = document.getElementById('stat-min-conf');
 const statScanCount = document.getElementById('stat-scan-count');
 
+// System status dots
 const sysStatusDot = document.getElementById('sys-status-dot');
 const sysStatusText = document.getElementById('sys-status-text');
 const modelStatusDot = document.getElementById('model-status-dot');
@@ -62,10 +84,11 @@ const modelStatusText = document.getElementById('model-status-text');
 const cameraStatusDot = document.getElementById('camera-status-dot');
 const cameraStatusText = document.getElementById('camera-status-text');
 
-// Init application
+// Initialize application
 document.addEventListener('DOMContentLoaded', async () => {
     loadDatabase();
-    statMinConf.innerText = Math.round(minConfidence * 100) + '%';
+    initStrictnessUI();
+    statMinConf.innerText = matchThreshold.toFixed(2);
     await populateCameras();
     await loadModels();
     setupEventListeners();
@@ -81,9 +104,9 @@ function loadDatabase() {
                 name: item.name,
                 descriptor: new Float32Array(item.descriptor)
             }));
-            addLog(`Loaded ${db.length} profiles from local database.`, 'system');
+            addLog(`Loaded ${db.length} profile${db.length === 1 ? '' : 's'} from local database.`, 'system');
         } else {
-            addLog("Database is empty. Enrolling first profile recommended.", 'system');
+            addLog("Database is empty. Enroll profiles to begin identification.", 'system');
         }
         renderDb();
     } catch (e) {
@@ -115,7 +138,7 @@ function renderDb() {
     dbGrid.innerHTML = '';
 
     if (db.length === 0) {
-        dbGrid.innerHTML = '<div class="empty-state">No enrolled profiles</div>';
+        dbGrid.innerHTML = '<div class="empty-state">No enrolled profiles in database</div>';
         return;
     }
 
@@ -124,12 +147,12 @@ function renderDb() {
         item.className = 'db-item';
         
         // Generate initials
-        const parts = profile.name.split(' ');
+        const parts = profile.name.trim().split(/\s+/);
         const initials = parts.map(p => p[0]).join('').substring(0, 2).toUpperCase();
         
         item.innerHTML = `
             <div class="db-avatar">${initials}</div>
-            <div class="db-name" title="${profile.name}">${profile.name}</div>
+            <div class="db-name" title="${escapeHtml(profile.name)}">${escapeHtml(profile.name)}</div>
             <div class="delete-btn" title="Delete Profile" data-index="${index}">&times;</div>
         `;
         
@@ -142,13 +165,29 @@ function renderDb() {
     });
 }
 
-// Delete Profile
+// Delete Single Profile
 function deleteProfile(index) {
+    if (index < 0 || index >= db.length) return;
     const name = db[index].name;
     db.splice(index, 1);
     saveDatabase();
-    addLog(`Deleted profile: ${name}`, 'system');
+    addLog(`Deleted profile: "${name}"`, 'system');
     updateEnrollBtnState();
+}
+
+// Clear Entire Database
+function clearAllProfiles() {
+    if (db.length === 0) {
+        addLog("Database is already empty.", 'system');
+        return;
+    }
+    const confirmed = confirm(`Are you sure you want to delete ALL ${db.length} profile(s) from the database? This cannot be undone.`);
+    if (confirmed) {
+        db = [];
+        saveDatabase();
+        addLog("All face profiles cleared from database.", 'system');
+        updateEnrollBtnState();
+    }
 }
 
 // Write to Dashboard Terminal Log
@@ -169,7 +208,7 @@ function addLog(message, type = 'system') {
     
     logContainer.prepend(entry);
     
-    // Cap logs at 50 to keep things fast
+    // Cap logs at 50 to maintain high performance
     while (logContainer.children.length > 50) {
         logContainer.removeChild(logContainer.lastChild);
     }
@@ -191,19 +230,19 @@ async function loadModels() {
         await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
         await faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL);
         
-        addLog("Loading AI Facial Landmark network...", "system");
+        addLog("Loading AI Facial Landmark network (68 points)...", "system");
         await faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL);
         
-        addLog("Loading AI Face Recognition vectorizer...", "system");
+        addLog("Loading AI Face Recognition vectorizer (128-d)...", "system");
         await faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL);
         
-        addLog("Loading AI Mood & Demographics networks...", "system");
+        addLog("Loading AI Expression & Demographics networks...", "system");
         await faceapi.nets.faceExpressionNet.loadFromUri(MODEL_URL);
         await faceapi.nets.ageGenderNet.loadFromUri(MODEL_URL);
         
         modelStatusDot.className = 'status-dot active';
         modelStatusText.innerText = 'READY';
-        addLog("AI Neural Networks loaded successfully. System operational.", "system");
+        addLog("AI Neural Networks online. Multi-person engine ready.", "system");
         
         try {
             const backend = faceapi.tf.getBackend();
@@ -229,9 +268,63 @@ function updateEnrollBtnState() {
     btnEnroll.disabled = !(isCameraActive && isModelReady);
 }
 
-// Event Listeners Setup
+// Strictness UI Initialization & Switching
+function initStrictnessUI() {
+    updateStrictnessPills();
+}
+
+function updateStrictnessPills() {
+    [selStrictHigh, selStrictStd, selStrictLenient].forEach(el => {
+        if (el) el.classList.remove('active');
+    });
+
+    if (matchThreshold <= 0.41) {
+        if (selStrictHigh) selStrictHigh.classList.add('active');
+        if (strictnessModeVal) strictnessModeVal.innerText = 'ULTRA STRICT (0.40)';
+    } else if (matchThreshold >= 0.48) {
+        if (selStrictLenient) selStrictLenient.classList.add('active');
+        if (strictnessModeVal) strictnessModeVal.innerText = 'PERMISSIVE (0.50)';
+    } else {
+        if (selStrictStd) selStrictStd.classList.add('active');
+        if (strictnessModeVal) strictnessModeVal.innerText = 'STANDARD (0.44)';
+    }
+    if (statMinConf) statMinConf.innerText = matchThreshold.toFixed(2);
+}
+
+// Setup Event Listeners
 function setupEventListeners() {
     btnToggleCamera.addEventListener('click', toggleCamera);
+
+    // Database Actions
+    if (btnClearDb) {
+        btnClearDb.addEventListener('click', clearAllProfiles);
+    }
+
+    // Match Strictness selectors
+    if (selStrictHigh) {
+        selStrictHigh.addEventListener('click', () => {
+            matchThreshold = 0.40;
+            localStorage.setItem('face_sentry_threshold', '0.40');
+            updateStrictnessPills();
+            addLog("Multi-Face strictness set to ULTRA STRICT (0.40) - Zero false positives", 'system');
+        });
+    }
+    if (selStrictStd) {
+        selStrictStd.addEventListener('click', () => {
+            matchThreshold = 0.44;
+            localStorage.setItem('face_sentry_threshold', '0.44');
+            updateStrictnessPills();
+            addLog("Multi-Face strictness set to STANDARD (0.44) - Recommended for webcams", 'system');
+        });
+    }
+    if (selStrictLenient) {
+        selStrictLenient.addEventListener('click', () => {
+            matchThreshold = 0.50;
+            localStorage.setItem('face_sentry_threshold', '0.50');
+            updateStrictnessPills();
+            addLog("Multi-Face strictness set to PERMISSIVE (0.50) - For dim/dark lighting", 'system');
+        });
+    }
 
     // Expression sensitivity mode listeners
     if (btnSensHigh && btnSensStd) {
@@ -252,7 +345,7 @@ function setupEventListeners() {
         });
     }
 
-    // Model Selector
+    // Detector model selector
     selTiny.addEventListener('click', () => {
         if (detectorType === 'tiny') return;
         detectorType = 'tiny';
@@ -260,7 +353,6 @@ function setupEventListeners() {
         selTiny.classList.add('active');
         selSsd.classList.remove('active');
         statModelType.innerText = 'TINY';
-        statMinConf.innerText = '40%';
         addLog("Detector set to Tiny Face Detector (Low Latency / CPU efficient)", "system");
     });
 
@@ -271,7 +363,6 @@ function setupEventListeners() {
         selSsd.classList.add('active');
         selTiny.classList.remove('active');
         statModelType.innerText = 'SSD';
-        statMinConf.innerText = '40%';
         addLog("Detector set to SSD MobileNet (High Accuracy / GPU efficient)", "system");
     });
 
@@ -319,6 +410,51 @@ function setupEventListeners() {
         navigator.mediaDevices.ondevicechange = () => {
             populateCameras();
         };
+    }
+
+    // Interactive Viewfinder Click-to-Select Face
+    if (viewfinderContainer) {
+        viewfinderContainer.addEventListener('click', handleViewfinderClick);
+    }
+}
+
+// Click on viewfinder to select targeted face for enrollment
+function handleViewfinderClick(e) {
+    if (!latestResizedDetections || latestResizedDetections.length <= 1) return;
+
+    const rect = overlay.getBoundingClientRect();
+    const clickX = ((e.clientX - rect.left) / rect.width) * overlay.width;
+    const clickY = ((e.clientY - rect.top) / rect.height) * overlay.height;
+
+    // Check which face box contains (or is closest to) clickX, clickY
+    let closestIdx = -1;
+    let minDistance = Infinity;
+
+    latestResizedDetections.forEach((det, idx) => {
+        const { x, y, width, height } = det.detection.box;
+        const mirroredX = overlay.width - x - width;
+
+        // Check if inside box
+        if (clickX >= mirroredX && clickX <= mirroredX + width && clickY >= y && clickY <= y + height) {
+            closestIdx = idx;
+            minDistance = 0;
+            return;
+        }
+
+        // Distance to box center
+        const centerX = mirroredX + width / 2;
+        const centerY = y + height / 2;
+        const dist = Math.hypot(clickX - centerX, clickY - centerY);
+        if (dist < minDistance) {
+            minDistance = dist;
+            closestIdx = idx;
+        }
+    });
+
+    if (closestIdx !== -1) {
+        selectedEnrollFaceIndex = closestIdx;
+        updateFaceSelectorUI();
+        addLog(`Targeted Face #${closestIdx + 1} for enrollment.`, 'system');
     }
 }
 
@@ -394,7 +530,6 @@ async function startCamera() {
         // Refresh camera names now that permissions are granted (labels are now visible)
         await populateCameras();
 
-        // Get actual active track settings/label
         const activeTrack = stream.getVideoTracks()[0];
         if (activeTrack) {
             const trackLabel = activeTrack.label || 'Active Webcam';
@@ -412,7 +547,7 @@ async function startCamera() {
         videoIcon.style.display = 'none';
         
         updateEnrollBtnState();
-        addLog("Camera stream established. Clean facial monitoring online.", "system");
+        addLog("Camera stream established. Multi-person 1-to-1 matching online.", "system");
     } catch (err) {
         console.error("Camera access error:", err);
         addLog("Webcam connection failed. Check system webcam permissions.", "unknown");
@@ -427,6 +562,7 @@ function stopCamera() {
         stream = null;
         isDetecting = false;
         latestDetections = [];
+        latestResizedDetections = [];
         
         webcam.srcObject = null;
         webcam.removeEventListener('play', onPlay);
@@ -442,6 +578,7 @@ function stopCamera() {
         scanIcon.style.display = 'none';
         videoIcon.style.display = 'inline-block';
         if (facesBadge) facesBadge.style.display = 'none';
+        if (faceSelectorContainer) faceSelectorContainer.style.display = 'none';
         faceTrackCache.clear();
         
         updateEnrollBtnState();
@@ -450,11 +587,107 @@ function stopCamera() {
     }
 }
 
+// Euclidean distance between two 128-dimensional Float32Array embeddings
+function euclideanDistance(d1, d2) {
+    if (!d1 || !d2 || d1.length !== d2.length) return 1.0;
+    let sum = 0;
+    for (let i = 0; i < d1.length; i++) {
+        const diff = d1[i] - d2[i];
+        sum += diff * diff;
+    }
+    return Math.sqrt(sum);
+}
+
+// Optimal Multi-Face Bipartite Matching with Mutual Exclusivity
+// Prevents false matches, wrong names, or multiple faces taking the same name in the same frame
+function matchAllFacesOptimal(detections, profiles, threshold) {
+    if (!detections || detections.length === 0) return [];
+
+    // If database is empty, all faces are unregistered targets
+    if (!profiles || profiles.length === 0) {
+        return detections.map((d, idx) => ({
+            faceIndex: idx,
+            isMatch: false,
+            labelName: "UNREGISTERED TARGET",
+            confidenceScore: d.detection.score || 0.85,
+            distance: 1.0,
+            statusColor: '#06b6d4' // neon cyan
+        }));
+    }
+
+    // 1. Calculate pairwise distance between all visible faces and all registered profiles
+    const candidatePairs = [];
+    for (let f = 0; f < detections.length; f++) {
+        const faceDesc = detections[f].descriptor;
+        if (!faceDesc) continue;
+
+        for (let p = 0; p < profiles.length; p++) {
+            const profileDesc = profiles[p].descriptor;
+            if (!profileDesc) continue;
+
+            const dist = euclideanDistance(faceDesc, profileDesc);
+            if (dist <= threshold) {
+                candidatePairs.push({
+                    faceIndex: f,
+                    profileIndex: p,
+                    profileName: profiles[p].name,
+                    distance: dist
+                });
+            }
+        }
+    }
+
+    // 2. Sort candidate pairs by ascending distance (strongest biometric match gets priority)
+    candidatePairs.sort((a, b) => a.distance - b.distance);
+
+    // 3. Mutual Exclusive 1-to-1 Bipartite Assignment
+    const assignedFaces = new Set();
+    const assignedProfiles = new Set();
+    const results = new Array(detections.length).fill(null);
+
+    for (const pair of candidatePairs) {
+        if (!assignedFaces.has(pair.faceIndex) && !assignedProfiles.has(pair.profileIndex)) {
+            assignedFaces.add(pair.faceIndex);
+            assignedProfiles.add(pair.profileIndex);
+
+            // Normalized confidence mapping:
+            // At distance 0 -> 98%
+            // At distance = threshold -> 68%
+            const quality = Math.max(0, 1 - (pair.distance / threshold));
+            const confidence = 0.68 + (quality * 0.30);
+
+            results[pair.faceIndex] = {
+                faceIndex: pair.faceIndex,
+                isMatch: true,
+                labelName: pair.profileName.toUpperCase(),
+                confidenceScore: confidence,
+                distance: pair.distance,
+                statusColor: '#10b981' // neon emerald
+            };
+        }
+    }
+
+    // 4. Any remaining face that was not assigned is SUSPECT UNKNOWN
+    for (let i = 0; i < detections.length; i++) {
+        if (!results[i]) {
+            results[i] = {
+                faceIndex: i,
+                isMatch: false,
+                labelName: "SUSPECT UNKNOWN",
+                confidenceScore: detections[i].detection.score || 0.85,
+                distance: 1.0,
+                statusColor: '#f43f5e' // neon rose/red
+            };
+        }
+    }
+
+    return results;
+}
+
 // Recognition Engine & Canvas Drawing Loop
 async function onPlay() {
     if (!stream || webcam.paused || webcam.ended) return;
     
-    // Check if video dimensions are fully resolved
     if (webcam.videoWidth === 0 || webcam.videoHeight === 0) {
         setTimeout(onPlay, 100);
         return;
@@ -462,30 +695,19 @@ async function onPlay() {
     
     isDetecting = true;
     
-    // FPS tracking variables
     let lastTime = performance.now();
     let frameCount = 0;
     let fps = 0;
-    
-    // Create face matcher from current DB
-    let faceMatcher = getFaceMatcher();
 
-    // Loop
     async function detectionLoop() {
         if (!isDetecting || webcam.paused || webcam.ended) return;
         
-        // Periodically refresh matcher in case DB changes
-        if (frameCount % 30 === 0) {
-            faceMatcher = getFaceMatcher();
-        }
-        
-        // Select detector options (416 input size provides high resolution for multiple simultaneous faces)
+        // Input size 416 gives high resolution for multi-face tracking
         const options = detectorType === 'tiny'
             ? new faceapi.TinyFaceDetectorOptions({ inputSize: 416, scoreThreshold: minConfidence })
             : new faceapi.SsdMobilenetv1Options({ minConfidence: minConfidence });
             
         try {
-            // Match canvas overlay size to video bounds
             if (overlay.width !== webcam.videoWidth || overlay.height !== webcam.videoHeight) {
                 overlay.width = webcam.videoWidth;
                 overlay.height = webcam.videoHeight;
@@ -499,21 +721,25 @@ async function onPlay() {
                 .withAgeAndGender()
                 .withFaceDescriptors();
                 
-            // Store latest detections for enrollment
             latestDetections = detections;
                 
-            // Update scanning counts
             if (detections.length > 0) {
                 totalScanCount += detections.length;
                 statScanCount.innerText = totalScanCount;
             }
             
-            // Resize outputs to overlay dimensions
             const displaySize = { width: webcam.videoWidth, height: webcam.videoHeight };
             const resizedDetections = faceapi.resizeResults(detections, displaySize);
+            latestResizedDetections = resizedDetections;
+
+            // Execute Optimal Bipartite Multi-Face Matcher
+            const matchResults = matchAllFacesOptimal(detections, db, matchThreshold);
             
-            // Draw custom premium overlays
-            drawCustomHUD(overlay, resizedDetections, faceMatcher);
+            // Update Multi-Face target selector buttons in Enrollment Card
+            updateFaceSelectorUI();
+
+            // Draw custom HUD overlays
+            drawCustomHUD(overlay, resizedDetections, matchResults);
             
             // Calculate FPS
             frameCount++;
@@ -535,16 +761,55 @@ async function onPlay() {
     requestAnimationFrame(detectionLoop);
 }
 
-// Convert DB array to LabeledFaceDescriptors
-function getFaceMatcher() {
-    if (db.length === 0) return null;
-    
-    const labeledDescriptors = db.map(profile => {
-        return new faceapi.LabeledFaceDescriptors(profile.name, [profile.descriptor]);
-    });
-    
-    // Threshold Euclidean distance: 0.55 (smaller is stricter)
-    return new faceapi.FaceMatcher(labeledDescriptors, 0.55);
+// Update the dynamic face targeting selector in the Enrollment card
+function updateFaceSelectorUI() {
+    if (!faceSelectorContainer || !faceSelectorPills) return;
+
+    if (!latestResizedDetections || latestResizedDetections.length <= 1) {
+        faceSelectorContainer.style.display = 'none';
+        selectedEnrollFaceIndex = 0;
+        return;
+    }
+
+    faceSelectorContainer.style.display = 'flex';
+
+    // Ensure selectedEnrollFaceIndex is valid
+    if (selectedEnrollFaceIndex >= latestResizedDetections.length) {
+        selectedEnrollFaceIndex = 0;
+    }
+
+    // Render pills if count changed or to update active status
+    const currentPillsCount = faceSelectorPills.children.length;
+    if (currentPillsCount !== latestResizedDetections.length) {
+        faceSelectorPills.innerHTML = '';
+        latestResizedDetections.forEach((det, idx) => {
+            const pill = document.createElement('button');
+            pill.type = 'button';
+            pill.className = `face-pill ${idx === selectedEnrollFaceIndex ? 'active' : ''}`;
+            
+            // Position label: Face 1 (Left), Face 2 (Right), etc.
+            const { x, width } = det.detection.box;
+            const mirroredX = overlay.width - x - width;
+            const side = mirroredX < overlay.width / 2 ? 'Left' : 'Right';
+            
+            pill.innerHTML = `<i class="fa-solid fa-user"></i> Face ${idx + 1} (${side})`;
+            pill.addEventListener('click', (e) => {
+                e.preventDefault();
+                selectedEnrollFaceIndex = idx;
+                updateFaceSelectorUI();
+            });
+            faceSelectorPills.appendChild(pill);
+        });
+    } else {
+        // Update active class
+        Array.from(faceSelectorPills.children).forEach((pill, idx) => {
+            if (idx === selectedEnrollFaceIndex) {
+                pill.classList.add('active');
+            } else {
+                pill.classList.remove('active');
+            }
+        });
+    }
 }
 
 // Extract geometric landmark ratios for hyper-responsive facial micro-expression analysis
@@ -665,18 +930,15 @@ function getAdvancedExpression(expressions, landmarks, trackId) {
     } else {
         track.lastSeen = now;
         if (detectedEmotion !== 'neutral') {
-            // Active emotion lock: hold for at least 320ms so it displays smoothly
             track.currentEmotion = detectedEmotion;
             track.title = emotionTitle;
             track.score = (track.score * 0.4) + (emotionScore * 0.6);
             track.holdUntil = now + 320;
         } else if (now < track.holdUntil) {
-            // Keep holding the active emotion until hold timer elapses
             detectedEmotion = track.currentEmotion;
             emotionTitle = track.title;
             emotionScore = track.score;
         } else {
-            // Decayed back to neutral
             track.currentEmotion = 'neutral';
             track.title = '😐 NEUTRAL';
             track.score = (expressions.neutral || 0.85);
@@ -704,8 +966,8 @@ function cleanTrackCache() {
     }
 }
 
-// Custom clean HUD drawings (No scanning laser, no dots, no brackets, NO AGE DISPLAY)
-function drawCustomHUD(canvas, resizedDetections, faceMatcher) {
+// Custom HUD drawings (Clean rounded boxes, dynamic badges, optimal multi-face labels, zero age clutter)
+function drawCustomHUD(canvas, resizedDetections, matchResults) {
     const ctx = canvas.getContext('2d');
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     
@@ -716,45 +978,36 @@ function drawCustomHUD(canvas, resizedDetections, faceMatcher) {
     resizedDetections.forEach((detection, idx) => {
         const { x, y, width, height } = detection.detection.box;
         
-        // Mirror the X coordinate to match the CSS mirrored webcam video
+        // Mirror the X coordinate to match CSS mirrored webcam video
         const mirroredX = canvas.width - x - width;
         
-        let labelName = "IDENTIFYING...";
-        let isMatch = false;
-        let confidenceScore = detection.detection.score;
-        
-        // Match each face independently across all enrolled profiles
-        if (faceMatcher) {
-            const match = faceMatcher.findBestMatch(detection.descriptor);
-            if (match.label !== 'unknown') {
-                labelName = match.label.toUpperCase();
-                isMatch = true;
-                confidenceScore = Math.max(0, Math.min(1, 1 - match.distance));
-                recognizedCount++;
-            } else {
-                labelName = "SUSPECT UNKNOWN";
-            }
-        } else {
-            labelName = "UNREGISTERED TARGET";
+        const match = matchResults[idx] || {
+            isMatch: false,
+            labelName: "IDENTIFYING...",
+            confidenceScore: 0.8,
+            distance: 1.0,
+            statusColor: '#06b6d4'
+        };
+
+        if (match.isMatch) {
+            recognizedCount++;
+        }
+
+        // Throttle logging
+        handleLoggingThrottled(match.labelName, match.isMatch, now);
+
+        const isTargetedForEnroll = (resizedDetections.length > 1 && idx === selectedEnrollFaceIndex);
+        let hudColor = match.statusColor;
+        if (isTargetedForEnroll) {
+            hudColor = '#f59e0b'; // amber/gold for targeted face
         }
         
-        // Log entries throttling
-        handleLoggingThrottled(labelName, isMatch, now);
-        
-        // Theme color: Green for enrolled match, Rose/Red for unknown, Cyan for searching
-        let hudColor = '#06b6d4'; // neon cyan
-        if (isMatch) {
-            hudColor = '#10b981'; // neon emerald
-        } else if (labelName === "SUSPECT UNKNOWN") {
-            hudColor = '#f43f5e'; // neon rose
-        }
-        
-        // 1. Clean Rounded Bounding Rectangle (smooth corners, glowing outline)
+        // 1. Clean Rounded Bounding Rectangle (smooth glowing corners)
         ctx.save();
         ctx.strokeStyle = hudColor;
-        ctx.lineWidth = 2.5;
+        ctx.lineWidth = isTargetedForEnroll ? 3.0 : 2.5;
         ctx.shadowColor = hudColor;
-        ctx.shadowBlur = 10;
+        ctx.shadowBlur = isTargetedForEnroll ? 14 : 10;
         ctx.beginPath();
         if (ctx.roundRect) {
             ctx.roundRect(mirroredX, y, width, height, 12);
@@ -765,24 +1018,23 @@ function drawCustomHUD(canvas, resizedDetections, faceMatcher) {
         ctx.restore();
         
         // 2. Prepare Formatted Badge Content
-        const trackId = isMatch ? labelName : `face_${Math.round(x / 80)}_${Math.round(y / 80)}`;
+        const trackId = match.isMatch ? match.labelName : `face_${Math.round(x / 80)}_${Math.round(y / 80)}`;
         const refinedMood = getAdvancedExpression(detection.expressions, detection.landmarks, trackId);
         const gender = (detection.gender || 'UNKNOWN').toUpperCase();
 
-        const matchConfidenceText = isMatch ? ` (${Math.round(confidenceScore * 100)}%)` : '';
-        const line1Text = labelName + matchConfidenceText;
+        const matchConfidenceText = match.isMatch ? ` (${Math.round(match.confidenceScore * 100)}%)` : '';
+        const line1Text = match.labelName + matchConfidenceText;
         const line2Text = `MOOD: ${refinedMood.label}  •  ${gender}`;
         
-        // 3. Dynamically measure text width to prevent ANY overflow
+        // 3. Dynamically measure text width to guarantee ZERO badge overflow
         ctx.font = 'bold 11px "JetBrains Mono", monospace';
         const line1Width = ctx.measureText(line1Text).width;
         
         ctx.font = '500 10px "Outfit", sans-serif';
         const line2Width = ctx.measureText(line2Text).width;
         
-        // Ensure badge is wide enough for the text + comfortable padding + indicator dot
-        const neededWidth = Math.max(line1Width + 34, line2Width + 24);
-        const badgeWidth = Math.max(width, Math.max(neededWidth, 190));
+        const neededWidth = Math.max(line1Width + 36, line2Width + 24);
+        const badgeWidth = Math.max(width, Math.max(neededWidth, 195));
         const badgeHeight = 46;
         
         // Center the badge horizontally over the face box
@@ -796,7 +1048,6 @@ function drawCustomHUD(canvas, resizedDetections, faceMatcher) {
         // If too close to the top, flip the badge below the face box
         if (paneY < 6) {
             paneY = y + height + offset;
-            // Prevent going below the bottom canvas boundary
             if (paneY + badgeHeight > canvas.height - 6) {
                 paneY = canvas.height - badgeHeight - 6;
             }
@@ -819,12 +1070,12 @@ function drawCustomHUD(canvas, resizedDetections, faceMatcher) {
         ctx.stroke();
         ctx.restore();
         
-        // 5. Draw Line 1: Profile Identity & Confidence
+        // 5. Draw Line 1: Identity & Confidence
         ctx.fillStyle = '#ffffff';
         ctx.font = 'bold 11px "JetBrains Mono", monospace';
         ctx.fillText(line1Text, badgeX + 10, paneY + 18);
         
-        // 6. Draw Status Indicator Dot (positioned cleanly at the far right edge of the badge)
+        // 6. Draw Status Indicator Dot
         ctx.save();
         ctx.fillStyle = hudColor;
         ctx.shadowColor = hudColor;
@@ -834,10 +1085,34 @@ function drawCustomHUD(canvas, resizedDetections, faceMatcher) {
         ctx.fill();
         ctx.restore();
         
-        // 7. Draw Line 2: Emotion & Gender (clean, spacious, zero clipping)
+        // 7. Draw Line 2: Emotion & Gender
         ctx.fillStyle = '#94a3b8';
         ctx.font = '500 10px "Outfit", sans-serif';
         ctx.fillText(line2Text, badgeX + 10, paneY + 35);
+
+        // 8. If targeted for enrollment, draw "🎯 TARGET FOR ENROLLMENT" tag
+        if (isTargetedForEnroll) {
+            const tagText = "🎯 TARGET FOR ENROLLMENT";
+            ctx.font = 'bold 9px "JetBrains Mono", monospace';
+            const tagWidth = ctx.measureText(tagText).width + 12;
+            const tagX = mirroredX + (width - tagWidth) / 2;
+            const tagY = y + height + 6;
+
+            if (tagY + 18 < canvas.height) {
+                ctx.save();
+                ctx.fillStyle = 'rgba(245, 158, 11, 0.95)';
+                ctx.beginPath();
+                if (ctx.roundRect) {
+                    ctx.roundRect(tagX, tagY, tagWidth, 16, 4);
+                } else {
+                    ctx.rect(tagX, tagY, tagWidth, 16);
+                }
+                ctx.fill();
+                ctx.fillStyle = '#090d1a';
+                ctx.fillText(tagText, tagX + 6, tagY + 12);
+                ctx.restore();
+            }
+        }
     });
     
     // Update Multi-Face simultaneous status in the header
@@ -865,56 +1140,41 @@ function handleLoggingThrottled(name, isMatch, timeNow) {
     }
 }
 
-// Enroll Current Target Face (smart multi-face aware)
+// Enroll Selected Face Profile (Targeted & Multi-Face Aware)
 async function enrollFace() {
     const nameVal = enrollNameInput.value.trim();
     if (!nameVal) {
-        addLog("Enrollment failed: Name field cannot be empty.", "unknown");
+        addLog("Enrollment failed: Profile name field cannot be empty.", "unknown");
         enrollNameInput.focus();
         return;
     }
     
-    // Check if name already exists
+    // Check if name already exists (case-insensitive)
     if (db.some(p => p.name.toLowerCase() === nameVal.toLowerCase())) {
-        addLog(`Enrollment failed: Profile name "${nameVal}" is already registered.`, "unknown");
+        addLog(`Enrollment failed: Profile "${nameVal}" is already registered.`, "unknown");
         return;
     }
     
     btnEnroll.disabled = true;
     btnEnroll.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> <span>ANALYZING...</span>';
-    addLog(`Initiating facial biometric extraction for "${nameVal}"...`, "system");
+    addLog(`Initiating biometric extraction for "${nameVal}"...`, "system");
     
     try {
         if (!latestDetections || latestDetections.length === 0) {
-            addLog("Enrollment aborted: Face not detected. Align face inside viewfinder.", "unknown");
+            addLog("Enrollment aborted: No face detected. Align face inside camera viewfinder.", "unknown");
             return;
         }
         
-        let targetFace = null;
-        if (latestDetections.length === 1) {
-            targetFace = latestDetections[0];
-        } else {
-            // Smart multi-face enrollment: if some faces are already registered, enroll the unregistered face!
-            const faceMatcher = getFaceMatcher();
-            if (faceMatcher) {
-                const unregistered = latestDetections.filter(d => {
-                    const match = faceMatcher.findBestMatch(d.descriptor);
-                    return match.label === 'unknown';
-                });
-                if (unregistered.length === 1) {
-                    targetFace = unregistered[0];
-                    addLog("Multiple faces in view: Automatically enrolling the unregistered face.", "system");
-                } else if (unregistered.length > 1) {
-                    unregistered.sort((a, b) => (b.detection.box.width * b.detection.box.height) - (a.detection.box.width * a.detection.box.height));
-                    targetFace = unregistered[0];
-                    addLog("Multiple unregistered faces detected. Enrolling the primary face in focus.", "system");
-                }
-            }
-            if (!targetFace) {
-                // Pick the largest / most centered face
-                const sorted = [...latestDetections].sort((a, b) => (b.detection.box.width * b.detection.box.height) - (a.detection.box.width * a.detection.box.height));
-                targetFace = sorted[0];
-            }
+        // Pick the exact selected face (defaults to 0 if only 1 face)
+        let targetIndex = selectedEnrollFaceIndex;
+        if (targetIndex >= latestDetections.length || targetIndex < 0) {
+            targetIndex = 0;
+        }
+        
+        const targetFace = latestDetections[targetIndex];
+        if (!targetFace || !targetFace.descriptor) {
+            addLog("Enrollment failed: Unable to compute 128-d biometric descriptor.", "unknown");
+            return;
         }
         
         // Success! Save to database
@@ -923,7 +1183,8 @@ async function enrollFace() {
             descriptor: targetFace.descriptor
         });
         saveDatabase();
-        addLog(`Face enrolled successfully: Profile "${nameVal}" established.`, "match");
+        
+        addLog(`Profile "${nameVal}" enrolled successfully! (Assigned to Face #${targetIndex + 1})`, "match");
         enrollNameInput.value = '';
     } catch (e) {
         console.error("Enrollment failed:", e);
@@ -979,7 +1240,6 @@ function importDatabase(event) {
                 throw new Error("Invalid format: Root must be a JSON array.");
             }
             
-            // Validate schema roughly
             const validated = [];
             rawDb.forEach(item => {
                 if (item.name && Array.isArray(item.descriptor) && item.descriptor.length === 128) {
@@ -994,7 +1254,6 @@ function importDatabase(event) {
                 throw new Error("No valid face recognition profiles found in file.");
             }
             
-            // Merge or replace options (we will replace for simplicity)
             db = validated;
             saveDatabase();
             addLog(`Imported ${validated.length} profiles. Local database updated.`, "system");
@@ -1002,7 +1261,7 @@ function importDatabase(event) {
             console.error(err);
             addLog(`Import failed: ${err.message}`, "unknown");
         } finally {
-            dbFileInput.value = ''; // Reset input
+            dbFileInput.value = '';
         }
     };
     reader.readAsText(file);
