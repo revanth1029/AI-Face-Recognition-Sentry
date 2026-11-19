@@ -1,6 +1,7 @@
 # AI SENTRY PRO - Facial Recognition & Micro-Expression Engine
 
 [![GitHub Repo](https://img.shields.io/badge/GitHub-revanth1029%2FAI--Face--Recognition--Sentry-blue?logo=github)](https://github.com/revanth1029/AI-Face-Recognition-Sentry)
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/revanth1029/AI-Face-Recognition-Sentry)
 [![TensorFlow.js](https://img.shields.io/badge/TensorFlow.js-Client--Side%20Inference-orange?logo=tensorflow)](https://js.tensorflow.org/)
 [![face-api.js](https://img.shields.io/badge/face--api.js-vladmandic-brightgreen)](https://github.com/vladmandic/face-api)
 
